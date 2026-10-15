@@ -1,0 +1,18 @@
+// RPC interface used by the tray application to control the Windows service
+// (Task 2.2). The transport is ALPC: both sides bind with the "ncalrpc"
+// protocol sequence, which Windows implements on top of ALPC.
+
+import "oaidl.idl";
+
+[
+    uuid(6f3a1c2e-9b44-4d7a-8f10-2c5e7a9b1d34),
+    version(1.0),
+    pointer_default(unique)
+]
+interface ServiceControl
+{
+    // Asks the service to stop. The service stops its RPC server, terminates
+    // every graphical application it launched, and reports SERVICE_STOPPED.
+    // An explicit primitive binding handle is used so no ACF is required.
+    void SvcStop([in] handle_t hBinding);
+}
