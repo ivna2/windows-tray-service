@@ -8,4 +8,6 @@ if(NOT MSVC)
     message(FATAL_ERROR "This project targets Windows / MSVC only.")
 endif()
 
+add_subdirectory(ipc)
 add_subdirectory(tray-app)
+add_subdirectory(service)
