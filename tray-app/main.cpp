@@ -108,12 +108,45 @@ std::wstring GetProcessImageName(DWORD pid) {
     return result;
 }
 
+// Returns the PID of the service process (0 if the service is not running).
+// This only needs SERVICE_QUERY_STATUS, which an ordinary user process can
+// obtain even though the service itself runs as LocalSystem.
+DWORD GetServiceProcessId() {
+    DWORD pid = 0;
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (scm) {
+        SC_HANDLE svc = OpenServiceW(scm, SERVICE_NAME, SERVICE_QUERY_STATUS);
+        if (svc) {
+            SERVICE_STATUS_PROCESS ssp = {};
+            DWORD needed = 0;
+            if (QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO,
+                    reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &needed)) {
+                pid = ssp.dwProcessId;
+            }
+            CloseServiceHandle(svc);
+        }
+        CloseServiceHandle(scm);
+    }
+    return pid;
+}
+
 // True when the parent process is the Windows service.
+//
+// The reliable check compares the parent PID with the service's own process
+// id reported by the SCM: a medium-integrity user process cannot read the
+// image name of the LocalSystem service process, so the image-name test is
+// only kept as a fallback.
 bool IsParentTheService() {
     DWORD parent = GetParentProcessId();
     if (parent == 0) {
         return false;
     }
+
+    DWORD servicePid = GetServiceProcessId();
+    if (servicePid != 0 && parent == servicePid) {
+        return true;
+    }
+
     std::wstring image = GetProcessImageName(parent);
     if (image.empty()) {
         return false;
