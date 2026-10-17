@@ -12,6 +12,10 @@ if(NOT MSVC)
     message(FATAL_ERROR "This project targets Windows / MSVC only.")
 endif()
 
+# Treat source files as UTF-8 so the Cyrillic string literals are encoded
+# correctly (otherwise MSVC assumes the system ANSI code page).
+add_compile_options(/utf-8)
+
 add_subdirectory(ipc)
 add_subdirectory(tray-app)
 add_subdirectory(service)
