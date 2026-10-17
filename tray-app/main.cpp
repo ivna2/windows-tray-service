@@ -1,46 +1,37 @@
-// Tray application (extended for Task 2.2).
+// Tray application (Task 2.1).
 //
-// In addition to the Task 2.1 behaviour (tray icon, context menu, single
-// instance, hidden start, background operation), this version cooperates with
-// the Windows service:
-//   * on start it checks who the parent process is. If the parent is not the
-//     service, it makes sure the service is running (starting it and waiting
-//     for the Running state if necessary) and then exits;
-//   * only when launched by the service does it run as a normal tray app;
-//   * the "Выход" items (window menu and tray menu) stop the service via RPC
-//     over ALPC. The service then terminates every application it launched.
+// A minimal Win32 GUI application that lives in the taskbar notification area
+// (the tray). It demonstrates the required behaviour:
+//   * adds a tray icon on start-up;
+//   * left click on the icon shows the main window;
+//   * right click on the icon shows a context menu ("Открыть", "Выход");
+//   * the main window has a "Файл -> Выход" menu item;
+//   * re-adds its tray icon when the taskbar is recreated (TaskbarCreated);
+//   * can start with the main window hidden (--hidden);
+//   * keeps running in the background when the main window is closed;
+//   * refuses to run more than once for the same user (named mutex).
 
 #include <windows.h>
 #include <shellapi.h>
 #include <sddl.h>
-#include <winsvc.h>
-#include <tlhelp32.h>
-#include <rpc.h>
 #include <string>
-#include <vector>
-
-#include "ipc_h.h"
-#include "ipc_endpoint.h"
 #include "resource.h"
-
-#pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "rpcrt4.lib")
 
 namespace {
 
 const wchar_t* kWindowClass = L"TrayAppMainWindow";
 const wchar_t* kWindowTitle = L"Tray Application";
-const wchar_t* kServiceImageName = L"TrayControlService.exe";
 
 NOTIFYICONDATAW g_nid = {};
-UINT g_taskbarCreatedMsg = 0;
+UINT g_taskbarCreatedMsg = 0;   // RegisterWindowMessage("TaskbarCreated")
 HANDLE g_singleInstanceMutex = nullptr;
 
-// ---- single instance (Task 2.1) -------------------------------------------
-
+// Builds a mutex name that is unique for the current user so that the
+// application can only run once per user. The user SID is stable across
+// sessions, which is exactly the "one instance per user" semantics asked for.
 std::wstring BuildPerUserMutexName() {
     std::wstring name = L"Global\\TrayApp_SingleInstance";
+
     HANDLE token = nullptr;
     if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
         DWORD size = 0;
@@ -62,6 +53,9 @@ std::wstring BuildPerUserMutexName() {
     return name;
 }
 
+// Returns true when this is the first instance for the user. On a repeated
+// launch the mutex already exists and the function returns false, letting the
+// caller exit before the tray icon is ever added.
 bool AcquireSingleInstance() {
     const std::wstring mutexName = BuildPerUserMutexName();
     g_singleInstanceMutex = CreateMutexW(nullptr, TRUE, mutexName.c_str());
@@ -70,113 +64,6 @@ bool AcquireSingleInstance() {
     }
     return GetLastError() != ERROR_ALREADY_EXISTS;
 }
-
-// ---- service interaction (Task 2.2) ---------------------------------------
-
-DWORD GetParentProcessId() {
-    DWORD pid = GetCurrentProcessId();
-    DWORD parent = 0;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) {
-        return 0;
-    }
-    PROCESSENTRY32W pe = {};
-    pe.dwSize = sizeof(pe);
-    if (Process32FirstW(snap, &pe)) {
-        do {
-            if (pe.th32ProcessID == pid) {
-                parent = pe.th32ParentProcessID;
-                break;
-            }
-        } while (Process32NextW(snap, &pe));
-    }
-    CloseHandle(snap);
-    return parent;
-}
-
-std::wstring GetProcessImageName(DWORD pid) {
-    std::wstring result;
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (h) {
-        wchar_t buffer[MAX_PATH] = {};
-        DWORD size = MAX_PATH;
-        if (QueryFullProcessImageNameW(h, 0, buffer, &size)) {
-            result = buffer;
-        }
-        CloseHandle(h);
-    }
-    return result;
-}
-
-// True when the parent process is the Windows service.
-bool IsParentTheService() {
-    DWORD parent = GetParentProcessId();
-    if (parent == 0) {
-        return false;
-    }
-    std::wstring image = GetProcessImageName(parent);
-    if (image.empty()) {
-        return false;
-    }
-    size_t slash = image.find_last_of(L"\\/");
-    std::wstring base = (slash == std::wstring::npos) ? image : image.substr(slash + 1);
-    return _wcsicmp(base.c_str(), kServiceImageName) == 0;
-}
-
-// Ensures the service is running: starts it if stopped and waits for Running.
-void EnsureServiceRunning() {
-    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-    if (!scm) {
-        return;
-    }
-    SC_HANDLE svc = OpenServiceW(scm, SERVICE_NAME, SERVICE_QUERY_STATUS | SERVICE_START);
-    if (svc) {
-        SERVICE_STATUS status = {};
-        if (QueryServiceStatus(svc, &status) && status.dwCurrentState == SERVICE_STOPPED) {
-            StartServiceW(svc, 0, nullptr);
-        }
-        // Wait (bounded) for the Running state.
-        for (int i = 0; i < 100; ++i) {
-            if (!QueryServiceStatus(svc, &status)) {
-                break;
-            }
-            if (status.dwCurrentState == SERVICE_RUNNING) {
-                break;
-            }
-            Sleep(100);
-        }
-        CloseServiceHandle(svc);
-    }
-    CloseServiceHandle(scm);
-}
-
-// Stops the service through RPC over ALPC (ncalrpc).
-void StopServiceViaRpc() {
-    RPC_WSTR stringBinding = nullptr;
-    if (RpcStringBindingComposeW(
-            nullptr,
-            reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(IPC_PROTSEQ)),
-            nullptr,
-            reinterpret_cast<RPC_WSTR>(const_cast<wchar_t*>(IPC_ENDPOINT)),
-            nullptr, &stringBinding) != RPC_S_OK) {
-        return;
-    }
-
-    handle_t binding = nullptr;
-    if (RpcBindingFromStringBindingW(stringBinding, &binding) == RPC_S_OK) {
-        RpcTryExcept {
-            SvcStop(binding);
-        }
-        RpcExcept(1) {
-            // Service already gone / not reachable: nothing to do.
-        }
-        RpcEndExcept
-        RpcBindingFree(&binding);
-    }
-    RpcStringFreeW(&stringBinding);
-}
-
-// ---- tray / window (Task 2.1) ---------------------------------------------
 
 void InitTrayIconData(HWND hwnd) {
     g_nid = {};
@@ -212,6 +99,7 @@ void ShowTrayContextMenu(HWND hwnd) {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT, L"Выход");
 
+    // Required so the menu closes correctly when the user clicks elsewhere.
     SetForegroundWindow(hwnd);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
     DestroyMenu(menu);
@@ -226,16 +114,15 @@ HMENU CreateMainMenu() {
     return menuBar;
 }
 
-// "Выход" stops the whole service (Task 2.2, requirements 3 and 4). The
-// service terminates this application as part of its stop sequence.
-void OnExitRequested(HWND hwnd) {
-    StopServiceViaRpc();
+// Fully quits the application: removes the tray icon and ends the message loop.
+void QuitApplication(HWND hwnd) {
     RemoveTrayIcon();
     DestroyWindow(hwnd);
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == g_taskbarCreatedMsg) {
+        // The taskbar (explorer) was recreated: our tray icon is gone, re-add it.
         AddTrayIcon(hwnd);
         return 0;
     }
@@ -263,12 +150,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             break;
         case IDM_TRAY_EXIT:
         case IDM_FILE_EXIT:
-            OnExitRequested(hwnd);
+            QuitApplication(hwnd);
             break;
         }
         return 0;
 
     case WM_CLOSE:
+        // Closing the main window hides it; the app keeps running in the tray.
         ShowWindow(hwnd, SW_HIDE);
         return 0;
 
@@ -281,6 +169,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+// Recognises the flags that request a hidden start-up.
 bool WantsHiddenStart(LPWSTR cmdLine) {
     std::wstring args = cmdLine ? cmdLine : L"";
     return args.find(L"--hidden") != std::wstring::npos ||
@@ -290,19 +179,8 @@ bool WantsHiddenStart(LPWSTR cmdLine) {
 
 } // namespace
 
-// MIDL memory-management callbacks required by the generated client stub.
-void* __RPC_USER MIDL_user_allocate(size_t size) { return malloc(size); }
-void __RPC_USER MIDL_user_free(void* p) { free(p); }
-
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
-    // Task 2.2: the application only runs as a tray app when the service is its
-    // parent. Any other (manual) launch just ensures the service is running
-    // and then exits.
-    if (!IsParentTheService()) {
-        EnsureServiceRunning();
-        return 0;
-    }
-
+    // Refuse a second instance before the tray icon is added.
     if (!AcquireSingleInstance()) {
         return 0;
     }
